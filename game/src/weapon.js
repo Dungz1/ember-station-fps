@@ -1,96 +1,158 @@
-// One hitscan rifle: a view model, a magazine, a reload, and the spread that punishes moving.
-// It owns the numbers; main.js owns the ray and the damage.
+// Weapon definitions and per-entity weapon state machines (ready -> firing cooldown -> reloading),
+// plus the first-person view models built from boxes. Every number here is tuned so the three
+// primaries feel distinct: the Viper-9 sprays and pays in money, the Manticore is the steady
+// all-rounder, the Longshot-7 punishes movement and rewards holding an angle.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 
-const MAG_SIZE = 30;
-const RESERVE = 90;
-const FIRE_GAP = 0.096;
-const RELOAD_TIME = 1.9;
-const SPREAD_STILL = 0.0022;
-const SPREAD_MOVING = 0.028;
-const MOVE_REFERENCE = 5.2;
-const MUZZLE_TIME = 0.06;
+export const WEAPONS = {
+  viper9: {
+    id: 'viper9', name: 'Viper-9', kind: 'primary', klass: 'SMG',
+    damage: 24, headMult: 3.0, rpm: 900, magSize: 32, reserveMax: 128,
+    reloadTime: 2.0, price: 1250, killReward: 600, auto: true, range: 55,
+    spreadBase: 0.014, spreadMove: 0.05, spreadAir: 0.11, spreadCrouchMult: 0.65, spreadShot: 0.0075,
+    recoilV: 0.55, recoilH: 0.32, noise: 34, zoomFov: 0,
+  },
+  manticore: {
+    id: 'manticore', name: 'Manticore', kind: 'primary', klass: 'Rifle',
+    damage: 34, headMult: 3.4, rpm: 640, magSize: 28, reserveMax: 84,
+    reloadTime: 2.4, price: 2900, killReward: 300, auto: true, range: 75,
+    spreadBase: 0.009, spreadMove: 0.06, spreadAir: 0.13, spreadCrouchMult: 0.6, spreadShot: 0.0085,
+    recoilV: 0.72, recoilH: 0.42, noise: 44, zoomFov: 0,
+  },
+  longshot7: {
+    id: 'longshot7', name: 'Longshot-7', kind: 'primary', klass: 'Sniper',
+    damage: 118, headMult: 2.3, rpm: 42, magSize: 5, reserveMax: 20,
+    reloadTime: 3.1, price: 4750, killReward: 100, auto: false, range: 120,
+    spreadBase: 0.0022, spreadMove: 0.09, spreadAir: 0.2, spreadCrouchMult: 0.5, spreadShot: 0,
+    recoilV: 1.6, recoilH: 0.55, noise: 60, zoomFov: 26,
+  },
+  furnace: {
+    id: 'furnace', name: 'Furnace', kind: 'grenade', klass: 'HE',
+    price: 300, maxCarry: 2, radius: 7.5, damage: 98, fuse: 2.0, throwSpeed: 17,
+  },
+  flare: {
+    id: 'flare', name: 'Flare', kind: 'grenade', klass: 'Flashbang',
+    price: 200, maxCarry: 2, radius: 17, flashTime: 2.8, fuse: 1.5, throwSpeed: 17,
+  },
+  kevlar: {
+    id: 'kevlar', name: 'Kevlar Vest', kind: 'armor', klass: 'Gear',
+    price: 650, armor: 100,
+  },
+};
 
-export function createWeapon(camera) {
-  const grip = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.hairline), roughness: 0.7, metalness: 0.2 });
-  const body = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.ink), roughness: 0.5, metalness: 0.35 });
+/** The buy menu's order: three primaries, two grenades, the vest. */
+export const BUY_ORDER = ['viper9', 'manticore', 'longshot7', 'furnace', 'flare', 'kevlar'];
 
-  const model = new THREE.Group();
-  const receiver = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.1, 0.42), body);
-  const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.045, 0.4), grip);
-  barrel.position.set(0, 0.025, -0.38);
-  const stock = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.08, 0.22), grip);
-  stock.position.set(0, -0.02, 0.3);
-  model.add(receiver, barrel, stock);
-  model.position.set(0.24, -0.2, -0.42);
-  camera.add(model);
+export function fireInterval(weapon) {
+  return 60 / weapon.rpm;
+}
 
-  const flash = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.24, 0.24),
-    new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.accent), transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide }),
-  );
-  flash.position.set(0.24, -0.18, -0.95);
-  flash.visible = false;
-  camera.add(flash);
+/** Give an entity a primary at full magazine and reserve. */
+export function giveWeapon(ent, id) {
+  const w = WEAPONS[id];
+  ent.weaponId = id;
+  ent.mag = w.magSize;
+  ent.reserve = w.reserveMax;
+  ent.reloadTimer = 0;
+  ent.fireTimer = 0;
+}
 
-  const flashLight = new THREE.PointLight(new THREE.Color(PALETTE.accent), 0, 5);
-  flashLight.position.set(0.24, -0.16, -0.6);
-  camera.add(flashLight);
+/** Round start top-up: full magazine, full reserve, no reload in progress. */
+export function refillWeapon(ent) {
+  const w = WEAPONS[ent.weaponId];
+  ent.mag = w.magSize;
+  ent.reserve = w.reserveMax;
+  ent.reloadTimer = 0;
+  ent.fireTimer = Math.min(ent.fireTimer, 0.15);
+}
 
-  const state = { mag: MAG_SIZE, reserve: RESERVE, cooldown: 0, reloadLeft: 0, flash: 0, kick: 0 };
+/**
+ * The firing state machine's one gate: true and a round is spent when the weapon is loaded, cool
+ * and not mid-reload. Empty guns dry-fire (the click is the player's problem).
+ */
+export function tryFire(ent) {
+  if (ent.reloadTimer > 0 || ent.fireTimer > 0) return false;
+  ent.fireTimer = fireInterval(WEAPONS[ent.weaponId]);
+  if (ent.mag <= 0) return true; // dry fire: still swings the hammer
+  ent.mag -= 1;
+  return true;
+}
 
-  function step(dt) {
-    state.cooldown = Math.max(0, state.cooldown - dt);
-    state.flash = Math.max(0, state.flash - dt);
-    state.kick += (0 - state.kick) * Math.min(1, dt * 14);
-    model.position.z = -0.42 + state.kick;
-    model.rotation.x = state.kick * 2.2;
-    flash.visible = state.flash > 0;
-    flash.rotation.z = state.flash * 30;
-    flashLight.intensity = state.flash > 0 ? 18 : 0;
-    if (state.reloadLeft > 0) {
-      state.reloadLeft = Math.max(0, state.reloadLeft - dt);
-      model.rotation.x = -0.55 * Math.min(1, (RELOAD_TIME - state.reloadLeft) * 2);
-      if (state.reloadLeft === 0) {
-        const need = MAG_SIZE - state.mag;
-        const take = Math.min(need, state.reserve);
-        state.mag += take;
-        state.reserve -= take;
-      }
+export function startReload(ent) {
+  const w = WEAPONS[ent.weaponId];
+  if (ent.reloadTimer > 0 || ent.mag >= w.magSize || ent.reserve <= 0) return false;
+  ent.reloadTimer = w.reloadTime;
+  return true;
+}
+
+/** Tick the cooldowns; finishes a reload by moving rounds from reserve into the mag. */
+export function stepWeapon(ent, dt) {
+  if (ent.fireTimer > 0) ent.fireTimer -= dt;
+  if (ent.reloadTimer > 0) {
+    ent.reloadTimer -= dt;
+    if (ent.reloadTimer <= 0) {
+      ent.reloadTimer = 0;
+      const w = WEAPONS[ent.weaponId];
+      const need = w.magSize - ent.mag;
+      const take = Math.min(need, ent.reserve);
+      ent.mag += take;
+      ent.reserve -= take;
     }
   }
+}
 
-  return {
-    state,
-    step,
-    ready() {
-      return state.mag > 0 && state.cooldown === 0 && state.reloadLeft === 0;
-    },
-    pullTrigger() {
-      state.cooldown = FIRE_GAP;
-      state.flash = MUZZLE_TIME;
-      state.kick = 0.055;
-    },
-    takeRound() {
-      if (state.mag <= 0) return false;
-      state.mag -= 1;
-      return true;
-    },
-    reload() {
-      if (state.reloadLeft > 0 || state.mag === MAG_SIZE || state.reserve === 0) return;
-      state.reloadLeft = RELOAD_TIME;
-    },
-    spread(speed) {
-      return SPREAD_STILL + Math.min(1, speed / MOVE_REFERENCE) * SPREAD_MOVING;
-    },
-    refill() {
-      state.mag = MAG_SIZE;
-      state.reserve = RESERVE;
-      state.cooldown = 0;
-      state.reloadLeft = 0;
-      state.flash = 0;
-      state.kick = 0;
-    },
-  };
+// ---------------------------------------------------------------- view models
+
+function part(group, w, h, d, x, y, z, material) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+  mesh.position.set(x, y, z);
+  group.add(mesh);
+  return mesh;
+}
+
+/**
+ * A first-person view model for one primary: a group whose forward is -Z, muzzle where the flash
+ * and tracers start. Geometry is shared-box primitives; materials are the palette's.
+ */
+export function createViewModel(id) {
+  const group = new THREE.Group();
+  const dark = new THREE.MeshStandardMaterial({ color: PALETTE.surfaceDark, roughness: 0.55, metalness: 0.65 });
+  const mid = new THREE.MeshStandardMaterial({ color: PALETTE.surfaceLight, roughness: 0.5, metalness: 0.7 });
+  const accent = new THREE.MeshStandardMaterial({
+    color: PALETTE.emberDim, roughness: 0.4, metalness: 0.5,
+    emissive: PALETTE.ember, emissiveIntensity: 0.55,
+  });
+  const grip = new THREE.MeshStandardMaterial({ color: 0x14171c, roughness: 0.9, metalness: 0.1 });
+  let muzzleZ = -0.7;
+  if (id === 'viper9') {
+    part(group, 0.075, 0.11, 0.5, 0, 0, -0.12, dark);            // receiver
+    part(group, 0.05, 0.05, 0.34, 0, 0.012, -0.5, mid);          // barrel shroud
+    part(group, 0.028, 0.028, 0.16, 0, 0.012, -0.72, accent);    // muzzle
+    part(group, 0.06, 0.16, 0.09, 0, -0.11, -0.02, grip);        // magazine
+    part(group, 0.055, 0.12, 0.1, 0, -0.09, 0.14, grip);         // grip
+    part(group, 0.02, 0.045, 0.1, 0, 0.095, -0.16, accent);      // sight rail
+    muzzleZ = -0.8;
+  } else if (id === 'manticore') {
+    part(group, 0.08, 0.12, 0.62, 0, 0, -0.1, dark);
+    part(group, 0.055, 0.055, 0.5, 0, 0.015, -0.62, mid);
+    part(group, 0.03, 0.03, 0.2, 0, 0.015, -0.92, accent);
+    part(group, 0.062, 0.17, 0.1, 0, -0.115, -0.02, grip);
+    part(group, 0.058, 0.125, 0.11, 0, -0.095, 0.18, grip);
+    part(group, 0.022, 0.05, 0.16, 0, 0.1, -0.18, accent);
+    part(group, 0.075, 0.09, 0.16, 0, -0.005, 0.28, dark);       // stock
+    muzzleZ = -1.02;
+  } else {
+    part(group, 0.085, 0.13, 0.8, 0, 0, -0.06, dark);
+    part(group, 0.05, 0.05, 0.72, 0, 0.02, -0.78, mid);
+    part(group, 0.032, 0.032, 0.22, 0, 0.02, -1.18, accent);
+    part(group, 0.06, 0.16, 0.1, 0, -0.115, 0.06, grip);
+    part(group, 0.06, 0.12, 0.12, 0, -0.1, 0.26, grip);
+    const scope = part(group, 0.06, 0.06, 0.3, 0, 0.135, -0.18, dark);
+    scope.rotation.x = 0;
+    part(group, 0.075, 0.1, 0.22, 0, 0, 0.36, dark);             // stock
+    muzzleZ = -1.28;
+  }
+  const muzzle = new THREE.Vector3(0, 0.015, muzzleZ);
+  return { group, muzzle };
 }

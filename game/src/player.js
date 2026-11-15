@@ -1,123 +1,98 @@
-// Player movement: acceleration, friction, gravity, crouch and jump, resolved as a box against
-// the world's colliders one axis at a time, so a wall never swallows the player.
-import * as THREE from 'three';
+// The player body: how a fighter moves through the station. Acceleration and friction are the
+// classic ground model (fast to start, faster to stop), gravity and jumping are plain, crouching
+// shrinks the collision box and the eye, and walking trades speed for silence. stepCharacter is
+// the shared half — the bots drive their bodies through the very same physics.
+import { moveBody } from './collision.js';
 
-const RADIUS = 0.34;
-const STAND_HEIGHT = 1.72;
-const CROUCH_HEIGHT = 1.12;
-const STAND_EYE = 1.6;
-const CROUCH_EYE = 1.02;
-const WALK_SPEED = 5.2;
-const CROUCH_SPEED = 2.4;
-const GROUND_ACCEL = 42;
-const AIR_ACCEL = 9;
-const FRICTION = 9;
-const GRAVITY = 20;
-const JUMP_SPEED = 6.2;
+export const PLAYER = {
+  halfWidth: 0.34,
+  height: 1.78,
+  crouchHeight: 1.25,
+  eye: 1.62,
+  crouchEye: 1.06,
+  runSpeed: 5.7,
+  walkSpeed: 2.7,
+  crouchSpeed: 2.4,
+  accel: 13,
+  friction: 9.5,
+  gravity: 22,
+  jumpSpeed: 7.1,
+  maxFall: -26,
+};
 
-export function createPlayer(colliders) {
-  const player = {
-    position: new THREE.Vector3(0, 0, 9.5),
-    velocity: new THREE.Vector3(),
-    yaw: 0,
-    pitch: 0,
-    eye: STAND_EYE,
-    onGround: true,
-    crouching: false,
-    height: STAND_HEIGHT,
-  };
-  const probe = new THREE.Box3();
-  const wish = new THREE.Vector3();
+/** Fill in the movement fields every fighter carries. */
+export function initBody(ent) {
+  ent.halfWidth = PLAYER.halfWidth;
+  ent.height = PLAYER.height;
+  ent.eye = PLAYER.eye;
+  ent.crouch = false;
+  ent.grounded = false;
+}
 
-  // lift keeps the feet and the crown out of the horizontal tests, so standing on the floor
-  // is not read as walking into a wall.
-  function overlaps(x, y, z, height, lift) {
-    probe.min.set(x - RADIUS, y + lift, z - RADIUS);
-    probe.max.set(x + RADIUS, y + height - lift, z + RADIUS);
-    for (const collider of colliders) if (probe.intersectsBox(collider)) return collider;
-    return null;
+function applyFriction(vel, dt) {
+  const speed = Math.hypot(vel.x, vel.z);
+  if (speed < 0.02) {
+    vel.x = 0;
+    vel.z = 0;
+    return;
   }
+  const keep = Math.max(0, speed - speed * PLAYER.friction * dt) / speed;
+  vel.x *= keep;
+  vel.z *= keep;
+}
 
-  function look(dx, dy, sensitivity = 0.0022) {
-    player.yaw -= dx * sensitivity;
-    player.pitch = Math.max(-1.45, Math.min(1.45, player.pitch - dy * sensitivity));
+function accelerate(vel, wishX, wishZ, wishSpeed, dt) {
+  const current = vel.x * wishX + vel.z * wishZ;
+  const add = wishSpeed - current;
+  if (add <= 0) return;
+  let push = PLAYER.accel * dt * wishSpeed;
+  if (push > add) push = add;
+  vel.x += push * wishX;
+  vel.z += push * wishZ;
+}
+
+/**
+ * Move one fighter one timestep: ground friction, acceleration toward (wishX, wishZ), gravity and
+ * collision resolution. (wishX, wishZ) must be unit or zero.
+ */
+export function stepCharacter(ent, wishX, wishZ, wishSpeed, dt, colliders) {
+  if (ent.grounded) applyFriction(ent.vel, dt);
+  if (wishSpeed > 0) accelerate(ent.vel, wishX, wishZ, wishSpeed, dt);
+  ent.vel.y = Math.max(PLAYER.maxFall, ent.vel.y - PLAYER.gravity * dt);
+  moveBody(ent.pos, ent.vel, dt, ent.halfWidth, ent.height, colliders, ent);
+}
+
+/**
+ * The player's step: crouch reshapes the body, the walk key trades speed for silence, and jump is
+ * only answered on the ground. `cmd` is the render loop's snapshot of the input state.
+ */
+export function stepPlayer(ent, cmd, dt, colliders) {
+  ent.crouch = !!cmd.crouch;
+  const targetHeight = ent.crouch ? PLAYER.crouchHeight : PLAYER.height;
+  const targetEye = ent.crouch ? PLAYER.crouchEye : PLAYER.eye;
+  const blend = Math.min(1, dt * 14);
+  ent.height += (targetHeight - ent.height) * blend;
+  ent.eye += (targetEye - ent.eye) * blend;
+
+  const speed = ent.crouch ? PLAYER.crouchSpeed : cmd.walk ? PLAYER.walkSpeed : PLAYER.runSpeed;
+  let f = 0;
+  let s = 0;
+  if (cmd.forward) f += 1;
+  if (cmd.back) f -= 1;
+  if (cmd.right) s += 1;
+  if (cmd.left) s -= 1;
+  let wishX = 0;
+  let wishZ = 0;
+  if (f !== 0 || s !== 0) {
+    const sin = Math.sin(ent.yaw);
+    const cos = Math.cos(ent.yaw);
+    // Forward is (-sin, -cos) and right is (cos, -sin) in three.js' yaw convention.
+    wishX = -sin * f + cos * s;
+    wishZ = -cos * f - sin * s;
+    const len = Math.hypot(wishX, wishZ);
+    wishX /= len;
+    wishZ /= len;
   }
-
-  function recoil(pitchKick, yawKick) {
-    player.pitch = Math.min(1.45, player.pitch + pitchKick);
-    player.yaw += yawKick;
-  }
-
-  function step(dt, keys) {
-    const crouching = keys.has('ControlLeft') || keys.has('ControlRight') || keys.has('KeyC');
-    if (crouching && !player.crouching) {
-      player.crouching = true;
-      player.height = CROUCH_HEIGHT;
-    } else if (!crouching && player.crouching && !overlaps(player.position.x, player.position.y, player.position.z, STAND_HEIGHT, 0.02)) {
-      player.crouching = false;
-      player.height = STAND_HEIGHT;
-    }
-    const eyeTarget = player.crouching ? CROUCH_EYE : STAND_EYE;
-    player.eye += (eyeTarget - player.eye) * Math.min(1, dt * 12);
-
-    const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
-    const strafe = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
-    wish.set(0, 0, 0);
-    if (forward || strafe) {
-      const sin = Math.sin(player.yaw);
-      const cos = Math.cos(player.yaw);
-      wish.set(-sin * forward + cos * strafe, 0, -cos * forward - sin * strafe).normalize();
-    }
-
-    const speed = player.crouching ? CROUCH_SPEED : WALK_SPEED;
-    const blend = Math.min(1, (player.onGround ? GROUND_ACCEL : AIR_ACCEL) * dt / speed);
-    player.velocity.x += (wish.x * speed - player.velocity.x) * blend;
-    player.velocity.z += (wish.z * speed - player.velocity.z) * blend;
-    if (player.onGround && !wish.lengthSq()) {
-      const damp = Math.max(0, 1 - FRICTION * dt);
-      player.velocity.x *= damp;
-      player.velocity.z *= damp;
-    }
-
-    if (keys.has('Space') && player.onGround) {
-      player.velocity.y = JUMP_SPEED;
-      player.onGround = false;
-    }
-    player.velocity.y -= GRAVITY * dt;
-
-    const nextX = player.position.x + player.velocity.x * dt;
-    if (!overlaps(nextX, player.position.y, player.position.z, player.height, 0.04)) player.position.x = nextX;
-    else player.velocity.x = 0;
-    const nextZ = player.position.z + player.velocity.z * dt;
-    if (!overlaps(player.position.x, player.position.y, nextZ, player.height, 0.04)) player.position.z = nextZ;
-    else player.velocity.z = 0;
-
-    player.position.y += player.velocity.y * dt;
-    player.onGround = false;
-    const hit = overlaps(player.position.x, player.position.y, player.position.z, player.height, 0);
-    if (hit && player.velocity.y <= 0) {
-      player.position.y = hit.max.y;
-      player.velocity.y = 0;
-      player.onGround = true;
-    } else if (hit) {
-      player.position.y = hit.min.y - player.height;
-      player.velocity.y = 0;
-    }
-    if (player.position.y < 0) {
-      player.position.y = 0;
-      player.velocity.y = 0;
-      player.onGround = true;
-    }
-    player.velocity.y = Math.max(-30, player.velocity.y);
-  }
-
-  return {
-    state: player,
-    step,
-    look,
-    recoil,
-    groundSpeed() {
-      return Math.hypot(player.velocity.x, player.velocity.z);
-    },
-  };
+  if (cmd.jump && ent.grounded) ent.vel.y = PLAYER.jumpSpeed;
+  stepCharacter(ent, wishX, wishZ, f !== 0 || s !== 0 ? speed : 0, dt, colliders);
 }
